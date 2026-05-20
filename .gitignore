@@ -1,0 +1,29 @@
+# === Secrets / local config ===
+config.env
+
+# === Runtime output ===
+enrollment_log.txt
+
+# === Claude Code ===
+.claude/
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# === PyInstaller build artifacts ===
+build/
+dist/
+*.spec
+
+# === Downloaded / generated installers ===
+tailscale-setup.exe
+*.tmp
+
+# === OS junk ===
+.DS_Store
+Thumbs.db
+desktop.ini
