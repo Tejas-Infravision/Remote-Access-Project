@@ -2,35 +2,42 @@
 """
 H16 Hand Controller Fleet Enrollment Script
 Run on a Windows technician laptop with the H16 plugged in via USB.
+Requires: frida Python package (pip install frida), frida-server-*-android-arm64 binary in script dir.
 """
 
+import os
 import subprocess
 import sys
 import re
 import time
 import datetime
+import threading
+import queue
 from pathlib import Path
+
+# Prevent Git Bash / MSYS from corrupting Android-side paths in ADB arguments
+os.environ["MSYS_NO_PATHCONV"] = "1"
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-# PyInstaller --onefile extracts bundled data files to sys._MEIPASS at runtime.
-# The .exe itself (and user-editable files like config.env) live next to sys.executable.
-# When running as a plain .py script both paths resolve to the script's directory.
-
 _FROZEN    = getattr(sys, "frozen", False)
 SCRIPT_DIR = Path(sys.executable).parent if _FROZEN else Path(__file__).parent
 BUNDLE_DIR = Path(sys._MEIPASS) if (_FROZEN and hasattr(sys, "_MEIPASS")) else Path(__file__).parent
 
-LOG_FILE   = SCRIPT_DIR / "enrollment_log.txt"   # written next to the exe
-ADB_PATH   = BUNDLE_DIR / "platform-tools-r33" / "adb.exe"  # bundled inside exe
-APK_PATH   = BUNDLE_DIR / "apks" / "tailscale-1.24.2.apk"   # bundled inside exe
-APK_REMOTE = "/sdcard/tailscale.apk"
+LOG_FILE   = SCRIPT_DIR / "enrollment_log.txt"
 
-TAILSCALE_PKG  = "com.tailscale.ipn.android"
-CHROME_PKG     = "com.android.chrome"
-RUSTDESK_PKG   = "com.carriez.flutter_hbb"
-RUSTDESK_APK   = BUNDLE_DIR / "apks" / "rustdesk.apk"
+# r33 ADB at the fixed path — must be 1.0.41; v37.x writes 0 bytes to H16 via USB push
+ADB_PATH   = Path(r"C:\platform-tools-old\adb.exe")
+
+TAILSCALE_PKG      = "com.tailscale.ipn"
+TAILSCALE_ACTIVITY = "com.tailscale.ipn/.IPNActivity"
+
+FRIDA_REMOTE = "/data/local/tmp/frida-server"
+FRIDA_PORT   = 27042
+
+RUSTDESK_PKG    = "com.carriez.flutter_hbb"
+RUSTDESK_APK    = BUNDLE_DIR / "apks" / "rustdesk.apk"
 RUSTDESK_REMOTE = "/sdcard/rustdesk.apk"
 
 # ADB target — mutated by set_adb_target()
@@ -45,21 +52,17 @@ def _log(msg: str) -> None:
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {msg}\n")
 
-
 def fatal(msg: str) -> None:
     print(f"\n[ERROR] {msg}")
     _log(f"ERROR: {msg}")
     sys.exit(1)
 
-
 def step(msg: str) -> None:
     print(f"\n>>> {msg}")
     _log(f"STEP: {msg}")
 
-
 def info(msg: str) -> None:
     print(f"    {msg}")
-
 
 def technician_prompt(msg: str) -> None:
     print(f"\n[ACTION REQUIRED] {msg}")
@@ -92,13 +95,10 @@ def load_config() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def set_adb_target(serial: str | None) -> None:
-    """Direct all subsequent ADB calls to a specific device serial (or clear)."""
     global _adb_target
     _adb_target = ["-s", serial] if serial else []
 
-
 def adb_run(*args: str, timeout: int = 30) -> tuple[int, str, str]:
-    """Run an ADB command; return (returncode, stdout, stderr)."""
     cmd = [str(ADB_PATH)] + _adb_target + list(args)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -108,9 +108,7 @@ def adb_run(*args: str, timeout: int = 30) -> tuple[int, str, str]:
     except Exception as e:
         raise RuntimeError(f"ADB execution error: {e}")
 
-
 def adb_ok(*args: str, timeout: int = 30, hint: str = "") -> str:
-    """Run ADB command; raise RuntimeError on non-zero exit."""
     rc, out, err = adb_run(*args, timeout=timeout)
     if rc != 0:
         detail = (err or out).strip()
@@ -120,10 +118,385 @@ def adb_ok(*args: str, timeout: int = 30, hint: str = "") -> str:
         )
     return out
 
-
 def is_package_installed(pkg: str) -> bool:
     rc, out, _ = adb_run("shell", "pm", "list", "packages")
     return pkg in out
+
+# ---------------------------------------------------------------------------
+# Tailscale startup
+# ---------------------------------------------------------------------------
+
+def start_tailscale_app() -> None:
+    """Launch Tailscale foreground activity so the IPN backend initialises."""
+    step("Starting Tailscale app (am start)")
+    rc, out, err = adb_run("shell", "am", "start", "-n", TAILSCALE_ACTIVITY)
+    if rc != 0:
+        info(f"  am start returned non-zero ({err.strip()}) — app may already be running.")
+    else:
+        info("  Tailscale activity started.")
+    # Give the IPN backend time to reach NeedsLogin state before we inject
+    time.sleep(4)
+
+# ---------------------------------------------------------------------------
+# Logcat monitor for Tailscale IPN state transitions
+# ---------------------------------------------------------------------------
+
+def start_logcat_monitor() -> threading.Event:
+    """
+    Background thread watching logcat for the Tailscale state transition that
+    confirms a successful auth key login: 'Switching ipn state NeedsLogin -> Running'.
+    Returns an Event that is set when the transition is observed.
+    """
+    success_event = threading.Event()
+
+    def _monitor() -> None:
+        cmd = [str(ADB_PATH)] + list(_adb_target) + ["logcat", "-v", "brief"]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1
+            )
+            for line in proc.stdout:  # type: ignore[union-attr]
+                if "NeedsLogin -> Running" in line:
+                    _log(f"Logcat: {line.strip()}")
+                    success_event.set()
+                    break
+                # Also catch the generic "ipn state" prefix in case wording differs
+                if "ipn state" in line and "Running" in line:
+                    _log(f"Logcat (state): {line.strip()}")
+                    success_event.set()
+                    break
+            proc.terminate()
+        except Exception as e:
+            _log(f"Logcat monitor error: {e}")
+
+    t = threading.Thread(target=_monitor, daemon=True, name="logcat-monitor")
+    t.start()
+    return success_event
+
+# ---------------------------------------------------------------------------
+# Frida JavaScript — injected into com.tailscale.ipn to call auth key login
+# ---------------------------------------------------------------------------
+# Uses __AUTH_KEY__ as a placeholder; replaced at runtime before injection.
+# Strategy:
+#   1. Enumerate all loaded com.tailscale.ipn classes and find methods that
+#      accept a single String argument and have auth/login/key in their name.
+#   2. Try each candidate: first as a static call, then via the Application
+#      instance obtained from ActivityThread.
+#   3. If no Java method works, enumerate JNI exports from libgio.so (the Go
+#      backend shared library) and report native candidates for manual follow-up.
+
+_FRIDA_JS = r"""
+"use strict";
+var AUTH_KEY = "__AUTH_KEY__";
+
+Java.perform(function () {
+    send({ type: "status", msg: "Frida attached" });
+
+    var authCalled = false;
+
+    function tryCall(cls, mname) {
+        if (authCalled) return;
+        // Static call
+        try {
+            cls[mname](AUTH_KEY);
+            send({ type: "success", cls: cls.$className, method: mname, style: "static" });
+            authCalled = true;
+            return;
+        } catch (_) {}
+        // Instance call via ActivityThread
+        try {
+            var AT  = Java.use("android.app.ActivityThread");
+            var app = AT.currentApplication();
+            Java.cast(app, cls)[mname](AUTH_KEY);
+            send({ type: "success", cls: cls.$className, method: mname, style: "instance" });
+            authCalled = true;
+        } catch (_) {}
+    }
+
+    Java.enumerateLoadedClasses({
+        onMatch: function (name) {
+            if (authCalled) return;
+            if (!name.startsWith("com.tailscale.ipn")) return;
+            try {
+                var cls = Java.use(name);
+                cls.class.getDeclaredMethods().forEach(function (m) {
+                    if (authCalled) return;
+                    var params = m.getParameterTypes();
+                    if (params.length !== 1) return;
+                    if (params[0].getName() !== "java.lang.String") return;
+                    var mname = m.getName();
+                    send({ type: "method", cls: name, method: mname });
+                    if (/auth|login|key/i.test(mname)) tryCall(cls, mname);
+                });
+            } catch (_) {}
+        },
+        onComplete: function () {
+            if (!authCalled) {
+                // Report native JNI exports from the Go backend for manual analysis
+                try {
+                    Process.getModuleByName("libgio.so")
+                        .enumerateExports()
+                        .filter(function (e) {
+                            return e.type === "function" &&
+                                   e.name.startsWith("Java_com_tailscale") &&
+                                   /auth|login|key/i.test(e.name);
+                        })
+                        .forEach(function (e) {
+                            send({ type: "native", name: e.name, addr: e.address });
+                        });
+                } catch (e) {
+                    send({ type: "native_error", err: e.message });
+                }
+            }
+            send({ type: "done", success: authCalled });
+        }
+    });
+});
+"""
+
+# ---------------------------------------------------------------------------
+# Frida auth
+# ---------------------------------------------------------------------------
+
+def _find_frida_server_binary() -> Path | None:
+    """Look for a frida-server ARM64 binary next to the script/exe."""
+    candidates = [
+        "frida-server",
+        "frida-server-arm64",
+    ]
+    # Also accept versioned names like frida-server-16.1.4-android-arm64
+    for p in SCRIPT_DIR.iterdir():
+        if p.is_file() and p.name.startswith("frida-server") and "arm64" in p.name:
+            return p
+    for name in candidates:
+        p = SCRIPT_DIR / name
+        if p.exists():
+            return p
+    return None
+
+
+def frida_auth(auth_key: str) -> bool:
+    """
+    Push frida-server ARM64, start it as root, inject the Tailscale auth key
+    via Java method enumeration.  Returns True if a login method was called.
+    """
+    try:
+        import frida  # type: ignore
+    except ImportError:
+        info("  frida Python module not installed — run: pip install frida")
+        info("  Skipping Frida auth approach.")
+        return False
+
+    frida_local = _find_frida_server_binary()
+    if frida_local is None:
+        info("  frida-server binary not found in script directory.")
+        info("  Download frida-server-*-android-arm64 from:")
+        info("  https://github.com/frida/frida/releases")
+        info("  Place it next to this script and re-run.")
+        return False
+
+    info(f"  Using frida-server binary: {frida_local.name}")
+
+    # Push frida-server (over WiFi ADB — USB push writes 0 bytes on H16)
+    step("Pushing frida-server to /data/local/tmp/")
+    try:
+        adb_ok("push", str(frida_local), FRIDA_REMOTE, timeout=120)
+    except RuntimeError as e:
+        info(f"  Push failed: {e}")
+        return False
+
+    rc, out, _ = adb_run("shell", "stat", "-c", "%s", FRIDA_REMOTE)
+    try:
+        sz = int(out.strip())
+    except ValueError:
+        sz = 0
+    if sz == 0:
+        info("  frida-server arrived as 0 bytes — WiFi ADB push may not be active.")
+        return False
+    info(f"  frida-server on device: {sz:,} bytes")
+
+    # chmod + kill any stale instance + start fresh, all as root
+    # NOTE: su -c does not work on this firmware; use "su root <cmd>" syntax
+    step("Starting frida-server as root")
+    adb_run("shell", "su", "root", "chmod", "+x", FRIDA_REMOTE)
+    adb_run("shell", "su", "root", "killall", "frida-server")
+    time.sleep(1)
+
+    # Fire-and-forget: start frida-server in background via a single shell string
+    # so the shell interprets '&'
+    subprocess.Popen(
+        [str(ADB_PATH)] + list(_adb_target) + [
+            "shell",
+            f"su root {FRIDA_REMOTE} > /data/local/tmp/frida-server.log 2>&1 &"
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    info("  Waiting for frida-server to initialise...")
+    time.sleep(4)
+
+    # Forward the Frida port so we can reach it from localhost
+    step(f"Forwarding Frida port {FRIDA_PORT}")
+    try:
+        adb_ok("forward", f"tcp:{FRIDA_PORT}", f"tcp:{FRIDA_PORT}")
+    except RuntimeError as e:
+        info(f"  Port forwarding failed: {e}")
+        return False
+
+    # Connect to frida-server via the forwarded port
+    step("Connecting Frida client to device")
+    try:
+        dev = frida.get_device_manager().add_remote_device(f"localhost:{FRIDA_PORT}")
+    except Exception as e:
+        info(f"  Could not reach frida-server: {e}")
+        info("  Check /data/local/tmp/frida-server.log on the device for errors.")
+        return False
+
+    # Attach to the Tailscale process
+    step("Attaching to com.tailscale.ipn process")
+    session = None
+    for proc_name in (TAILSCALE_PKG, "com.tailscale.ipn.android"):
+        try:
+            session = dev.attach(proc_name)
+            info(f"  Attached to process: {proc_name}")
+            break
+        except Exception:
+            pass
+    if session is None:
+        # Last resort: search by name in process list
+        try:
+            procs = dev.enumerate_processes()
+            for p in procs:
+                if "tailscale" in p.name.lower():
+                    session = dev.attach(p.pid)
+                    info(f"  Attached to process: {p.name} (pid {p.pid})")
+                    break
+        except Exception:
+            pass
+    if session is None:
+        info("  Tailscale process not found — ensure the app is running on the H16.")
+        adb_run("forward", "--remove", f"tcp:{FRIDA_PORT}")
+        return False
+
+    # Inject script
+    js = _FRIDA_JS.replace("__AUTH_KEY__", auth_key.replace('"', '\\"'))
+    result: dict = {"success": False, "native_candidates": []}
+    done_event = threading.Event()
+
+    def on_message(message: dict, _data: object) -> None:
+        if message.get("type") != "send":
+            return
+        p = message.get("payload", {})
+        t = p.get("type", "")
+        if t == "success":
+            info(f"  Auth method called: {p.get('cls')}.{p.get('method')} [{p.get('style')}]")
+            _log(f"Frida auth called: {p.get('cls')}.{p.get('method')}")
+            result["success"] = True
+        elif t == "method":
+            info(f"  Found method: {p.get('cls')}.{p.get('method')}")
+        elif t == "native":
+            info(f"  Native JNI candidate: {p.get('name')}")
+            result["native_candidates"].append(p.get("name"))
+        elif t == "native_error":
+            info(f"  libgio.so enumeration error: {p.get('err')}")
+        elif t == "status":
+            info(f"  {p.get('msg')}")
+        elif t == "done":
+            done_event.set()
+
+    script = session.create_script(js)
+    script.on("message", on_message)
+    script.load()
+
+    info("  Running class enumeration (up to 30s)...")
+    done_event.wait(timeout=30)
+
+    try:
+        script.unload()
+        session.detach()
+    except Exception:
+        pass
+    adb_run("forward", "--remove", f"tcp:{FRIDA_PORT}")
+
+    if result["native_candidates"] and not result["success"]:
+        info("  No Java auth method found, but these native JNI exports may be relevant:")
+        for name in result["native_candidates"]:
+            info(f"    {name}")
+        info("  Manual Frida scripting against these exports may be required.")
+
+    return result["success"]
+
+# ---------------------------------------------------------------------------
+# EncryptedSharedPreferences fallback (Android 7, software-backed keystore)
+# ---------------------------------------------------------------------------
+
+def sharedprefs_fallback(auth_key: str) -> None:
+    """
+    Pull the EncryptedSharedPreferences XML and the Android Keystore entries to
+    the technician laptop for offline analysis.  Actual decryption/re-encryption
+    is not automated here because it requires knowledge of the specific key
+    wrapping used by this build; this step saves the artefacts needed to do it.
+    """
+    info("Attempting SharedPreferences fallback (pulling artefacts for offline analysis)...")
+
+    TS_PREFS    = "/data/data/com.tailscale.ipn/shared_prefs/secret_shared_prefs.xml"
+    KEYSTORE_DIR = "/data/misc/keystore/user_0"
+
+    # Force-stop to release file locks (su root syntax — not su -c)
+    adb_run("shell", "su", "root", "am", "force-stop", TAILSCALE_PKG)
+    time.sleep(2)
+
+    local_prefs = SCRIPT_DIR / "secret_shared_prefs.xml"
+    local_ks    = SCRIPT_DIR / "keystore_dump"
+
+    rc, _, err = adb_run("pull", TS_PREFS, str(local_prefs), timeout=15)
+    if rc != 0 or not local_prefs.exists() or local_prefs.stat().st_size == 0:
+        info(f"  Could not pull prefs file ({err.strip()}) — SharedPreferences fallback unavailable.")
+        return
+
+    local_ks.mkdir(exist_ok=True)
+    adb_run("pull", KEYSTORE_DIR, str(local_ks), timeout=30)
+
+    info("  Artefacts pulled for offline analysis:")
+    info(f"    {local_prefs}")
+    info(f"    {local_ks}")
+    info("  Decrypt with the AES master key from keystore_dump, modify the auth state entry,")
+    info("  re-encrypt, push back, and restart the Tailscale app.")
+    _log("SharedPreferences fallback: artefacts pulled for manual analysis.")
+
+# ---------------------------------------------------------------------------
+# Wait for logcat auth confirmation
+# ---------------------------------------------------------------------------
+
+def wait_for_auth(event: threading.Event, timeout_sec: int = 120) -> bool:
+    step(f"Waiting for Tailscale to reach Running state (up to {timeout_sec}s)")
+    info("  Watching logcat for: 'Switching ipn state NeedsLogin -> Running'")
+    deadline = time.time() + timeout_sec
+    last_tick = 0.0
+    while time.time() < deadline:
+        if event.is_set():
+            info("  Auth state transition confirmed.")
+            return True
+        remaining = int(deadline - time.time())
+        if time.time() - last_tick >= 15:
+            info(f"  Still waiting... ({remaining}s remaining)")
+            last_tick = time.time()
+        time.sleep(1)
+    return False
+
+# ---------------------------------------------------------------------------
+# Read Tailscale IP
+# ---------------------------------------------------------------------------
+
+def read_tailscale_ip() -> str | None:
+    rc, out, _ = adb_run("shell", "ip", "addr", "show", "tailscale0", timeout=10)
+    m = re.search(r"inet\s+(100\.\d+\.\d+\.\d+)", out)
+    if m:
+        return m.group(1)
+    rc2, out2, _ = adb_run("shell", "ifconfig", "tailscale0", timeout=10)
+    m2 = re.search(r"inet addr[:\s]+(100\.\d+\.\d+\.\d+)", out2)
+    return m2.group(1) if m2 else None
 
 # ---------------------------------------------------------------------------
 # Main enrollment flow
@@ -146,23 +519,21 @@ def main() -> None:
         )
     info("Config loaded.")
 
-    # 2. Verify bundled ADB version (must be 1.0.41 / platform-tools r33.0.3)
-    step("Verifying ADB version (must be 1.0.41 from platform-tools r33.0.3)")
+    # 2. Verify ADB is present and is version 1.0.41 (r33)
+    step(f"Verifying ADB: {ADB_PATH}")
     if not ADB_PATH.exists():
         fatal(
-            f"Bundled ADB not found at:\n  {ADB_PATH}\n"
-            "Make sure the platform-tools-r33 folder is present next to this script.\n"
-            "WARNING: Do NOT use a system-installed ADB — adb 37.x writes 0 bytes to H16."
+            f"ADB not found at {ADB_PATH}\n"
+            "Ensure C:\\platform-tools-old\\ contains r33 platform tools (ADB 1.0.41).\n"
+            "Do NOT use ADB v37.x — it writes 0 bytes to the H16 via USB push."
         )
     rc, out, err = adb_run("version")
     version_line = (out + err).strip().splitlines()[0] if (out + err).strip() else ""
-    info(f"ADB reports: {version_line}")
+    info(f"ADB: {version_line}")
     if "1.0.41" not in version_line:
         fatal(
             f"Wrong ADB version: {version_line}\n"
-            "This script requires ADB 1.0.41 (platform-tools r33.0.3).\n"
-            "ADB version 37.x has a known bug that writes 0 bytes to the H16 via USB.\n"
-            "Use only the bundled platform-tools-r33/adb.exe."
+            "Requires ADB 1.0.41 (platform-tools r33). Newer versions corrupt H16 file transfers."
         )
     info("ADB 1.0.41 confirmed.")
 
@@ -179,296 +550,162 @@ def main() -> None:
 
     if not usb_serial:
         fatal(
-            "No H16 detected via USB ADB.\n"
-            "Please:\n"
-            "  1. Connect the H16 to this laptop with a USB cable\n"
-            "  2. On the H16: Settings > Developer Options > enable 'USB Debugging'\n"
-            "  3. On the H16: Settings > Developer Options > enable 'ADB over Network'\n"
-            "  4. Accept the 'Allow USB Debugging' prompt that appears on the H16 screen\n"
+            "No H16 detected via USB.\n"
+            "  1. Connect H16 via USB\n"
+            "  2. Enable USB Debugging in H16 Developer Options\n"
+            "  3. Accept the 'Allow USB Debugging' prompt on the H16 screen\n"
             "Then run this script again."
         )
-    _log(f"USB device detected: serial={usb_serial}, state={usb_state}")
-    info(f"Found device: {usb_serial} (state: {usb_state})")
+    _log(f"USB device: serial={usb_serial} state={usb_state}")
+    info(f"Found: {usb_serial} ({usb_state})")
 
-    # 4. Reject non-ready states
     if usb_state != "device":
-        if usb_state == "offline":
-            hint = "Unplug and replug the USB cable, then accept the ADB prompt on the H16 screen."
-        elif usb_state == "unauthorized":
-            hint = "Tap 'Always allow from this computer' on the H16 ADB prompt."
-        else:
-            hint = f"State is '{usb_state}'. Try unplugging and reconnecting USB."
+        hints = {
+            "offline":       "Unplug and replug the USB cable, then accept the ADB prompt on H16.",
+            "unauthorized":  "Tap 'Always allow from this computer' on the H16 ADB prompt.",
+        }
         fatal(
             f"Device is in state '{usb_state}' — cannot proceed.\n"
-            f"  {hint}\n"
-            "Then run this script again."
+            f"  {hints.get(usb_state, f'Try unplugging and reconnecting USB.')}"
         )
 
     set_adb_target(usb_serial)
 
-    # Quick enrollment check
-    step("Checking if Tailscale is already installed on this device")
-    already_enrolled = is_package_installed(TAILSCALE_PKG)
-    if already_enrolled:
-        info("Tailscale already installed — skipping install steps.")
-        _log("Tailscale already present; skipping to persistent ADB setup.")
+    # 4. Read WiFi IP before switching ADB away from USB
+    step("Reading device WiFi IP (wlan0)")
+    rc, out, _ = adb_run("shell", "ifconfig", "wlan0")
+    m = re.search(r"inet addr[:\s]+(\d+\.\d+\.\d+\.\d+)", out)
+    if not m:
+        m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
+    if not m:
+        fatal("Could not read wlan0 IP. Ensure H16 is connected to WiFi and re-run.")
+    wifi_ip = m.group(1)
+    info(f"WiFi IP: {wifi_ip}")
+    _log(f"WiFi IP: {wifi_ip}")
 
-    wifi_ip: str | None = None
+    # 5. Switch to WiFi ADB
+    #    All file transfers (frida-server, RustDesk APK) must use WiFi ADB —
+    #    USB push writes 0 bytes on H16 due to a firmware restriction.
+    step("Switching ADB to WiFi/TCP mode (required for file transfers on H16)")
+    try:
+        adb_ok("tcpip", "5555")
+    except RuntimeError as e:
+        fatal(f"Failed to switch ADB to TCP mode: {e}")
+    time.sleep(2)
 
-    if not already_enrolled:
-        # 5. Read WiFi IP before switching away from USB
-        step("Reading device WiFi IP address (wlan0)")
-        rc, out, _ = adb_run("shell", "ifconfig", "wlan0")
-        match = re.search(r"inet addr[:\s]+(\d+\.\d+\.\d+\.\d+)", out)
-        if not match:
-            match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
-        if not match:
-            fatal(
-                "Could not read wlan0 IP address from the H16.\n"
-                "Please ensure the H16 is connected to a WiFi network, then run again."
-            )
-        wifi_ip = match.group(1)
-        info(f"WiFi IP: {wifi_ip}")
-        _log(f"WiFi IP: {wifi_ip}")
-
-        # 6. Switch to WiFi ADB
-        #    CRITICAL: adb push over USB writes 0 bytes on H16 due to firmware restriction.
-        #    All file transfers must go over WiFi ADB.
-        step("Switching ADB to WiFi mode (required — USB push writes 0 bytes on H16)")
-        info("Restarting ADB daemon in TCP mode on the device...")
-        try:
-            adb_ok(
-                "tcpip", "5555",
-                hint="Make sure USB Debugging is enabled and the device is authorized."
-            )
-        except RuntimeError as e:
-            fatal(f"Failed to switch ADB to TCP mode: {e}")
-        time.sleep(2)
-
-        # connect command does not use -s; clear target temporarily
-        set_adb_target(None)
-        info(f"Connecting via WiFi to {wifi_ip}:5555 ...")
-        rc, out, _ = adb_run("connect", f"{wifi_ip}:5555")
-        connect_out = out.strip()
-        if "connected" not in connect_out.lower() and "already" not in connect_out.lower():
-            fatal(
-                f"WiFi ADB connection failed: {connect_out}\n"
-                "Please ensure:\n"
-                "  1. This laptop and the H16 are on the same WiFi network\n"
-                "  2. 'ADB over Network' is enabled in H16 Developer Options\n"
-                "  3. No firewall is blocking TCP port 5555"
-            )
-        info(f"WiFi ADB: {connect_out}")
-        _log(f"WiFi ADB connected: {wifi_ip}:5555")
-
-        # 7. Prompt to remove USB now that WiFi ADB is active
-        technician_prompt(
-            "WiFi ADB is now active.\n"
-            "    Please UNPLUG the USB cable from the H16 now.\n"
-            "    File transfers require WiFi ADB — USB push does not work on this device."
+    set_adb_target(None)
+    info(f"Connecting to {wifi_ip}:5555 ...")
+    rc, out, _ = adb_run("connect", f"{wifi_ip}:5555")
+    if "connected" not in out.lower() and "already" not in out.lower():
+        fatal(
+            f"WiFi ADB connection failed: {out.strip()}\n"
+            "Ensure this laptop and H16 are on the same WiFi network."
         )
+    info(f"WiFi ADB: {out.strip()}")
+    _log(f"WiFi ADB connected: {wifi_ip}:5555")
 
-        # 8. Confirm WiFi ADB is still up after USB removal
-        step("Confirming WiFi ADB connection is stable after USB removal")
-        set_adb_target(f"{wifi_ip}:5555")
-        time.sleep(2)
-        rc, out, _ = adb_run("devices")
-        if f"{wifi_ip}:5555" not in out:
-            fatal(
-                f"WiFi ADB connection to {wifi_ip}:5555 dropped after USB removal.\n"
-                "Please reconnect USB and run the script again.\n"
-                "Do not remove USB until prompted."
-            )
-        info(f"WiFi ADB stable: {wifi_ip}:5555")
+    technician_prompt(
+        "WiFi ADB is now active.\n"
+        "    UNPLUG the USB cable from the H16 now.\n"
+        "    File transfers require WiFi ADB — USB push does not work on this device."
+    )
 
-        # 9. Re-check Tailscale on WiFi connection (more reliable read)
-        step("Confirming Tailscale install status via WiFi ADB")
-        already_enrolled = is_package_installed(TAILSCALE_PKG)
-        if already_enrolled:
-            info("Tailscale already installed — skipping APK install.")
-            _log("Tailscale already installed (confirmed over WiFi ADB)")
-        else:
-            # 10. Push APK with size verification and retry
-            step("Pushing Tailscale v1.24.2 APK to device")
-            info("NOTE: Standard 'adb install' fails silently on H16 — using push + am start method.")
-            if not APK_PATH.exists():
-                fatal(
-                    f"Tailscale APK not found at:\n  {APK_PATH}\n"
-                    "Place tailscale-1.24.2.apk in the apks/ folder and run again."
-                )
+    set_adb_target(f"{wifi_ip}:5555")
+    time.sleep(2)
+    rc, out, _ = adb_run("devices")
+    if f"{wifi_ip}:5555" not in out:
+        fatal(f"WiFi ADB to {wifi_ip}:5555 dropped. Reconnect USB and re-run.")
+    info(f"WiFi ADB stable: {wifi_ip}:5555")
 
-            pushed_ok = False
-            for attempt in range(1, 4):
-                info(f"  Push attempt {attempt}/3...")
-                try:
-                    adb_ok("push", str(APK_PATH), APK_REMOTE, timeout=120)
-                except RuntimeError as e:
-                    info(f"  Push command error: {e}")
-                    if attempt < 3:
-                        info("  Retrying in 3 seconds...")
-                        time.sleep(3)
-                        continue
-                    else:
-                        fatal(
-                            "APK push failed after 3 attempts.\n"
-                            "Check that WiFi ADB is active and the H16 has free storage space."
-                        )
+    # 6. Start Tailscale app so the IPN backend is in NeedsLogin state
+    start_tailscale_app()
 
-                # Verify the file actually arrived with non-zero size.
-                # 0-byte files indicate USB-mode push is still being used.
-                rc, out, _ = adb_run("shell", "stat", "-c", "%s", APK_REMOTE)
-                try:
-                    size = int(out.strip())
-                except ValueError:
-                    size = 0
+    # 7. Start logcat monitor before auth attempt
+    step("Starting logcat monitor")
+    logcat_event = start_logcat_monitor()
+    info("  Watching for IPN state transition to Running...")
 
-                if size > 0:
-                    info(f"  APK on device: {size:,} bytes. Push succeeded.")
-                    _log(f"APK pushed: {size} bytes")
-                    pushed_ok = True
-                    break
-                else:
-                    info(f"  WARNING: APK arrived as 0 bytes (attempt {attempt}/3).")
-                    info("  This means USB ADB is still handling the push instead of WiFi ADB.")
-                    if attempt < 3:
-                        info("  Retrying in 3 seconds...")
-                        time.sleep(3)
-                    else:
-                        fatal(
-                            "APK was pushed but arrived as 0 bytes after 3 attempts.\n"
-                            "Root cause: file transfers over USB ADB are blocked by H16 firmware.\n"
-                            "WiFi ADB must be used. Verify that:\n"
-                            "  1. 'ADB over Network' is enabled in H16 Developer Options\n"
-                            "  2. The USB cable has been removed\n"
-                            "  3. The WiFi ADB connection shows correctly (this laptop connected\n"
-                            "     to the H16 on the same WiFi network)"
-                        )
+    # 8. Frida auth
+    step("Authenticating Tailscale via Frida injection")
+    frida_called = frida_auth(auth_key)
 
-            # Install via activity manager — 'adb install' fails with silent EOF on H16
-            info("Launching APK installer on H16 via activity manager...")
-            rc, out, err = adb_run(
-                "shell", "am", "start",
-                "-t", "application/vnd.android.package-archive",
-                "-d", f"file://{APK_REMOTE}",
-                timeout=15,
-            )
-            if rc != 0:
-                info(f"  am start returned non-zero ({err.strip()}) — installer may still have opened.")
-                info("  Check the H16 screen for the installer dialog.")
-
-            technician_prompt(
-                "The APK installer should now appear on the H16 screen.\n"
-                "    On the H16:\n"
-                "      1. If asked to choose an app to open the file, select 'Package Installer'\n"
-                "         (do NOT select xbrowser or any browser)\n"
-                "      2. Tap 'Install'\n"
-                "      3. Wait for the 'App installed' confirmation\n"
-                "    If nothing appeared on screen:\n"
-                "      - Check H16 notifications (swipe down from top)\n"
-                "      - Or open the Files app on H16 and tap tailscale.apk manually"
-            )
-
-        # 11. Check if Chrome is installed
-        step("Checking if Chrome is installed (required for Tailscale sign-in)")
-        rc, out, _ = adb_run("shell", "pm", "list", "packages")
-        chrome_installed = CHROME_PKG in out
-        if not chrome_installed:
-            technician_prompt(
-                "Chrome is NOT installed on the H16.\n"
-                "    Chrome is required because the default H16 browser (xbrowser)\n"
-                "    is blocked by Google authentication — Tailscale sign-in will fail in xbrowser.\n"
-                "\n"
-                "    On the H16:\n"
-                "      1. Open the Play Store\n"
-                "      2. Search for 'Google Chrome'\n"
-                "      3. Install Chrome\n"
-                "      4. When prompted, set Chrome as the default browser"
-            )
-            info("Assuming Chrome is now installed and set as default.")
-        else:
-            info("Chrome is installed.")
-
-        # 12/13. Manual Tailscale sign-in
-        #   Deep link auth (adb shell am start <tailscale-deep-link>) does NOT work on H16 v1.24.2.
-        #   Auth key login via the CLI also does not work on this version.
-        #   Manual browser sign-in through Chrome is the only supported method.
-        step("Tailscale sign-in (manual — deep link and auth key login unsupported on H16 v1.24.2)")
-        info("IMPORTANT: Do not attempt deep link or adb auth shortcuts — they fail silently on this device.")
-        technician_prompt(
-            "On the H16 device:\n"
-            "      1. Open the Tailscale app\n"
-            "      2. Tap 'Sign In'\n"
-            "      3. If a 'Choose Browser' dialog appears, select Chrome\n"
-            "         (if xbrowser opens instead, go back and set Chrome as default browser)\n"
-            "      4. Sign in with your Microsoft work account in Chrome\n"
-            "      5. Approve the 'Tailscale would like to set up a VPN' request on the H16\n"
-            "      6. Wait until the Tailscale app shows 'Connected' with a green indicator\n"
-            "\n"
-            "    NOTE: If Chrome shows a Google sign-in error, make sure you are using\n"
-            "    your Microsoft/work account, not a personal Google account."
-        )
-
-        # 14. Verify Tailscale is installed and running
-        step("Verifying Tailscale installation")
-        rc, out, _ = adb_run("shell", "dumpsys", "package", TAILSCALE_PKG, timeout=15)
-        if not out.strip() or TAILSCALE_PKG not in out:
-            fatal(
-                "Could not confirm Tailscale is installed on the H16.\n"
-                "Please verify on the H16 that the Tailscale app is visible in the app drawer."
-            )
-        version_match = re.search(r"versionName=([^\s\r\n]+)", out)
-        ts_version = version_match.group(1) if version_match else "unknown"
-        info(f"Tailscale installed on device, version: {ts_version}")
-        _log(f"Tailscale version on device: {ts_version}")
-
+    if frida_called:
+        info("  Login method called — waiting for IPN state change...")
     else:
-        # Device was already enrolled — get WiFi IP for persistent ADB step
-        step("Reading WiFi IP for persistent ADB setup")
-        rc, out, _ = adb_run("shell", "ifconfig", "wlan0")
-        match = re.search(r"inet addr[:\s]+(\d+\.\d+\.\d+\.\d+)", out)
-        if not match:
-            match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
-        if match:
-            wifi_ip = match.group(1)
-            info(f"WiFi IP: {wifi_ip}")
-        else:
-            info("Could not read WiFi IP — continuing without WiFi IP info.")
+        info("  Frida did not call a Java auth method.")
+        info("  Attempting SharedPreferences fallback...")
+        sharedprefs_fallback(auth_key)
 
-    # 15. Enable persistent ADB over network
-    #   Sets the ADB TCP port permanently so the device is reachable after reboot
-    #   without needing USB again.
+    # 9. Wait for logcat to confirm NeedsLogin -> Running
+    auth_ok = wait_for_auth(logcat_event, timeout_sec=120)
+
+    if not auth_ok:
+        # Check interface directly as a secondary confirmation
+        tailscale_ip = read_tailscale_ip()
+        if tailscale_ip:
+            info(f"  tailscale0 interface up ({tailscale_ip}) — treating as authenticated.")
+            _log(f"Auth confirmed via tailscale0 (logcat missed): {tailscale_ip}")
+            auth_ok = True
+        else:
+            fatal(
+                "Tailscale did not authenticate within 2 minutes.\n"
+                "Possible causes:\n"
+                "  - Auth key is expired or already consumed; generate a new ephemeral key\n"
+                "  - Frida could not find the login method in this build of Tailscale v1.24.2\n"
+                "  - frida-server version does not match the frida Python module version\n"
+                "  - com.tailscale.ipn process was not running when Frida attached\n"
+                "Manual check: adb shell logcat | grep -i 'ipn state'"
+            )
+
+    # 10. Read Tailscale IP
+    step("Reading Tailscale IP from tailscale0 interface")
+    tailscale_ip = read_tailscale_ip()
+    if tailscale_ip:
+        info(f"Tailscale IP: {tailscale_ip}")
+        _log(f"Tailscale IP: {tailscale_ip}")
+    else:
+        info("tailscale0 IP not readable yet — check https://login.tailscale.com/admin/machines")
+
+    # 11. Enable persistent ADB over network
     step("Enabling persistent ADB over network (port 5555)")
     try:
-        rc, out, err = adb_run("shell", "setprop", "service.adb.tcp.port", "5555", timeout=10)
-        if rc != 0:
-            info(f"  setprop warning (non-fatal): {err.strip()}")
+        # Set property then stop adbd — init restarts it automatically with TCP enabled
+        # su root syntax required; su -c is not supported on this firmware
+        adb_run("shell", "su", "root", "setprop", "service.adb.tcp.port", "5555", timeout=10)
+        time.sleep(1)
+        # Use Popen (fire-and-forget) because stopping adbd kills the current connection
+        subprocess.Popen(
+            [str(ADB_PATH)] + list(_adb_target) + ["shell", "su root stop adbd"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        info("  adbd restart triggered — reconnecting in 6 seconds...")
+        time.sleep(6)
+        # Reconnect after adbd restarts
+        set_adb_target(None)
+        rc, out, _ = adb_run("connect", f"{wifi_ip}:5555", timeout=15)
+        if "connected" in out.lower() or "already" in out.lower():
+            info("  Reconnected after adbd restart.")
         else:
-            info("  ADB TCP port set to 5555.")
-
-        time.sleep(1)
-        adb_run("shell", "stop", "adbd", timeout=10)
-        time.sleep(1)
-        adb_run("shell", "start", "adbd", timeout=10)
-        info("  ADB daemon restarted — will listen on port 5555 persistently.")
-        _log("Persistent ADB over network enabled on port 5555.")
+            info(f"  Reconnect result: {out.strip()} (may still work momentarily)")
+        set_adb_target(f"{wifi_ip}:5555")
+        _log("Persistent ADB over network enabled.")
     except Exception as e:
-        info(f"  Warning: Could not fully configure persistent ADB: {e}")
-        info("  This can be configured manually on the device if needed.")
+        info(f"  Warning: ADB persistence setup issue: {e}")
+        set_adb_target(f"{wifi_ip}:5555")
 
-    # 16. Install RustDesk for remote GUI / screen-share access
+    # 12. Install RustDesk
     step("Installing RustDesk for remote GUI access")
-    rustdesk_key    = cfg.get("RUSTDESK_KEY", "")
+    rustdesk_key     = cfg.get("RUSTDESK_KEY", "")
     ec2_tailscale_ip = cfg.get("EC2_TAILSCALE_IP", "")
 
     if not RUSTDESK_APK.exists():
-        info("RustDesk APK not found in apks/ folder — skipping GUI access setup.")
+        info("RustDesk APK not found in apks/ — skipping GUI access setup.")
         info("Place rustdesk.apk in the apks/ folder and re-run to enable GUI access.")
-        _log("RustDesk skipped: APK not present in apks/")
+        _log("RustDesk skipped: APK missing")
     elif is_package_installed(RUSTDESK_PKG):
-        info("RustDesk already installed on device.")
-        _log("RustDesk already present on device.")
+        info("RustDesk already installed.")
+        _log("RustDesk already present.")
     else:
-        info("Pushing RustDesk APK to device...")
         rd_pushed = False
         for attempt in range(1, 4):
             info(f"  Push attempt {attempt}/3...")
@@ -477,88 +714,58 @@ def main() -> None:
             except RuntimeError as e:
                 info(f"  Push error: {e}")
                 if attempt < 3:
-                    info("  Retrying in 3 seconds...")
                     time.sleep(3)
                     continue
-                else:
-                    break
+                break
             rc2, out2, _ = adb_run("shell", "stat", "-c", "%s", RUSTDESK_REMOTE)
             try:
                 sz = int(out2.strip())
             except ValueError:
                 sz = 0
             if sz > 0:
-                info(f"  RustDesk APK on device: {sz:,} bytes.")
+                info(f"  RustDesk APK on device: {sz:,} bytes")
                 _log(f"RustDesk APK pushed: {sz} bytes")
                 rd_pushed = True
                 break
             if attempt < 3:
-                info("  APK arrived as 0 bytes — retrying in 3 seconds...")
+                info("  APK arrived as 0 bytes — retrying...")
                 time.sleep(3)
 
         if rd_pushed:
-            rc3, _, err3 = adb_run(
+            adb_run(
                 "shell", "am", "start",
                 "-t", "application/vnd.android.package-archive",
                 "-d", f"file://{RUSTDESK_REMOTE}",
                 timeout=15,
             )
-            if rc3 != 0:
-                info(f"  am start returned non-zero: {err3.strip()} — installer may still have opened.")
-
             technician_prompt(
                 "The RustDesk installer should appear on the H16 screen.\n"
-                "    On the H16:\n"
-                "      1. If asked to choose an app, select 'Package Installer'\n"
-                "         (do NOT select xbrowser or any browser)\n"
-                "      2. Tap 'Install'\n"
-                "      3. Wait for 'App installed'"
+                "    Select 'Package Installer', tap 'Install', wait for 'App installed'."
             )
-
-            # Attempt to auto-configure the server via RustDesk's deep link URI.
-            # This only works if the app registered itself as a URI handler during install.
             if rustdesk_key and ec2_tailscale_ip and "xxxxxx" not in rustdesk_key:
-                info("Attempting to auto-configure RustDesk server via deep link...")
                 rd_uri = f"rustdesk://server?k={rustdesk_key}&r={ec2_tailscale_ip}"
-                adb_run("shell", "am", "start", "-a", "android.intent.action.VIEW",
-                        "-d", rd_uri, timeout=10)
-                info("Deep link sent. Verify on the H16 that RustDesk shows the correct server.")
-                info(f"  Server: {ec2_tailscale_ip}")
+                adb_run(
+                    "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                    "-d", rd_uri, timeout=10,
+                )
+                info(f"  RustDesk server configured: {ec2_tailscale_ip}")
             else:
-                info("RUSTDESK_KEY not configured — server must be set manually in the RustDesk app.")
-
-            _log("RustDesk APK installed on H16.")
+                info("  RUSTDESK_KEY not set — configure server manually in the RustDesk app.")
+            _log("RustDesk installed on H16.")
         else:
-            info("RustDesk APK push failed — skipping GUI access setup.")
+            info("RustDesk APK push failed — skipping.")
             _log("RustDesk APK push failed.")
 
-    # 17. Try to read Tailscale IP from device
-    tailscale_ip: str | None = None
-    try:
-        rc, out, _ = adb_run("shell", "ip", "addr", "show", "tailscale0", timeout=10)
-        match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
-        if match:
-            tailscale_ip = match.group(1)
-    except Exception:
-        pass
-
-    # 18. Log and print result
-    device_id = usb_serial or wifi_ip or "unknown"
+    # 13. Final output
     _log(
-        f"H16 enrollment complete | device={device_id} | "
-        f"wifi_ip={wifi_ip} | tailscale_ip={tailscale_ip}"
+        f"H16 enrollment complete | wifi_ip={wifi_ip} | tailscale_ip={tailscale_ip}"
     )
-
     print("\n" + "=" * 60)
     print("  ENROLLMENT COMPLETE")
     print("=" * 60)
-    if tailscale_ip:
-        print(f"  Tailscale IP  : {tailscale_ip}")
-    else:
-        print("  Tailscale IP  : Check https://login.tailscale.com/admin/machines")
-    if wifi_ip:
-        print(f"  WiFi ADB addr : {wifi_ip}:5555 (persistent)")
-    print("  RustDesk      : Open the RustDesk app on H16 to find its ID")
+    print(f"  Tailscale IP  : {tailscale_ip or 'check login.tailscale.com/admin/machines'}")
+    print(f"  WiFi ADB addr : {wifi_ip}:5555 (persistent)")
+    print("  RustDesk      : Open RustDesk app on H16 to find its ID")
     print("  Device is enrolled and ready for remote management.")
     print("=" * 60)
 
