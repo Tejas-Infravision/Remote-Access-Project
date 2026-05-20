@@ -23,6 +23,9 @@ Before enrolling any device, confirm ALL of the following:
       values (it should NOT contain "xxxxxx" or "AAAA...").
       If it still has placeholder values, contact the engineering team.
 
+  [ ] If enrolling an H16 and GUI access is required, confirm that
+      rustdesk.apk is present in the apks/ folder alongside tailscale.apk.
+
   [ ] The device you are enrolling is fully powered on and functional.
 
   [ ] You have a WiFi network available that the device can connect to
@@ -190,6 +193,62 @@ STEP 5 — Enrollment complete
 
   Write down the Tailscale IP address and report it to the engineering team.
 
+
+===================================================================
+GUI ACCESS (RUSTDESK)
+===================================================================
+
+After enrollment, the engineering team can get a full graphical desktop
+view of GCS laptops, Jetson computers, and H16 hand controllers using
+RustDesk — an open-source remote desktop tool.
+
+PREREQUISITES (engineering team — one-time EC2 server setup)
+-------------------------------------------------------------
+Before enrolling any device with GUI access, the EC2 management server
+must be running the RustDesk relay components:
+
+  1. On the EC2 server, download and run hbbs (ID server) and hbbr (relay):
+       ./hbbs -r <EC2_TAILSCALE_IP>
+       ./hbbr
+
+  2. After hbbs starts for the first time it creates id_ed25519.pub in
+     the same directory. Copy the entire contents of that file and paste
+     it as the RUSTDESK_KEY value in config.env before enrolling devices.
+
+  3. Ports required on the EC2 server (Tailscale mesh only):
+       21115 TCP — hbbs (NAT test)
+       21116 TCP/UDP — hbbs (peer ID registration)
+       21117 TCP — hbbr (relay traffic)
+       21118 TCP — hbbs (websocket)
+       21119 TCP — hbbr (websocket)
+
+CONNECTING TO A DEVICE
+----------------------
+  1. Install RustDesk on your engineering workstation:
+       https://rustdesk.com (download the desktop client)
+
+  2. In RustDesk settings, set the relay server:
+       Network > ID/Relay Server > enter EC2_TAILSCALE_IP
+       Key > paste RUSTDESK_KEY
+
+  3. Enter the device's RustDesk ID (printed at the end of enrollment
+     or visible in the RustDesk app on the device) and click Connect.
+
+  4. When prompted for a password, use the one-time password shown in
+     the RustDesk app on the device, or configure a permanent password
+     in the RustDesk settings on the device.
+
+H16 HAND CONTROLLER NOTES
+  - After enrollment, open the RustDesk app on the H16 to see its ID.
+  - The H16 must have the RustDesk APK placed in the apks/ folder
+    before running enroll_h16.py. Download rustdesk.apk from
+    https://github.com/rustdesk/rustdesk/releases and rename it
+    to rustdesk.apk in the apks/ folder.
+
+JETSON NOTES
+  - RustDesk on the Jetson requires an active display session to share
+    the screen. If the Jetson runs headless, SSH remains the primary
+    remote access method; RustDesk will work when a monitor is connected.
 
 ===================================================================
 HOW TO CONFIRM ENROLLMENT WORKED

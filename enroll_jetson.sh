@@ -381,7 +381,90 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 12/13: Done
+# Step 12: Install RustDesk for remote GUI access
+# ---------------------------------------------------------------------------
+
+RUSTDESK_KEY="${RUSTDESK_KEY:-}"
+RUSTDESK_VERSION="1.3.9"
+RD_ID=""
+
+step "Installing RustDesk for remote GUI access"
+
+if [[ -z "$RUSTDESK_KEY" || "$RUSTDESK_KEY" == *"xxxxxx"* ]]; then
+    info "RUSTDESK_KEY not configured in config.env — skipping RustDesk install."
+    info "Set RUSTDESK_KEY to the hbbs public key and re-run to enable GUI access."
+    _log "RustDesk skipped: RUSTDESK_KEY not configured."
+else
+    if command -v rustdesk &>/dev/null; then
+        info "RustDesk already installed."
+        _log "RustDesk already present."
+    else
+        if [[ "$ARCH" == "aarch64" ]]; then
+            RD_URL="https://github.com/rustdesk/rustdesk/releases/download/${RUSTDESK_VERSION}/rustdesk-${RUSTDESK_VERSION}-aarch64.deb"
+        else
+            RD_URL="https://github.com/rustdesk/rustdesk/releases/download/${RUSTDESK_VERSION}/rustdesk-${RUSTDESK_VERSION}-x86_64.deb"
+        fi
+        RD_DEB="/tmp/rustdesk.deb"
+        info "Downloading RustDesk ${RUSTDESK_VERSION} for ${ARCH} ..."
+        if command -v curl &>/dev/null; then
+            curl -fsSL "$RD_URL" -o "$RD_DEB" || fatal "Failed to download RustDesk from $RD_URL"
+        elif command -v wget &>/dev/null; then
+            wget -qO "$RD_DEB" "$RD_URL" || fatal "Failed to download RustDesk from $RD_URL"
+        else
+            fatal "Neither curl nor wget available — cannot download RustDesk."
+        fi
+        dpkg -i "$RD_DEB" 2>/dev/null || true
+        apt-get install -y -f 2>/dev/null || true   # fix any missing dependencies
+        rm -f "$RD_DEB"
+        if ! command -v rustdesk &>/dev/null; then
+            fatal "RustDesk installation failed. Check logs above."
+        fi
+        info "RustDesk installed."
+        _log "RustDesk installed."
+    fi
+
+    # Write server config for the target user account
+    RD_CONFIG_DIR="$TARGET_HOME/.config/rustdesk"
+    mkdir -p "$RD_CONFIG_DIR"
+    chown "$TARGET_USER:$TARGET_USER" "$RD_CONFIG_DIR"
+    cat > "$RD_CONFIG_DIR/RustDesk2.toml" << EOF
+[options]
+custom-rendezvous-server = '$EC2_TAILSCALE_IP'
+key = '$RUSTDESK_KEY'
+relay-server = '$EC2_TAILSCALE_IP'
+api-server = 'http://$EC2_TAILSCALE_IP'
+EOF
+    chown "$TARGET_USER:$TARGET_USER" "$RD_CONFIG_DIR/RustDesk2.toml"
+    info "RustDesk server config written for user $TARGET_USER."
+
+    # Also write to /root so the config is available if rustdesk is invoked as root
+    mkdir -p /root/.config/rustdesk
+    cat > /root/.config/rustdesk/RustDesk2.toml << EOF
+[options]
+custom-rendezvous-server = '$EC2_TAILSCALE_IP'
+key = '$RUSTDESK_KEY'
+relay-server = '$EC2_TAILSCALE_IP'
+api-server = 'http://$EC2_TAILSCALE_IP'
+EOF
+    info "RustDesk server config also written for root."
+    _log "RustDesk configured: server=$EC2_TAILSCALE_IP"
+
+    # Allow the user service to persist without an active login session
+    loginctl enable-linger "$TARGET_USER" 2>/dev/null || true
+
+    # Retrieve the RustDesk ID (requires the display server; may be empty on headless)
+    RD_ID="$(sudo -u "$TARGET_USER" rustdesk --get-id 2>/dev/null || true)"
+    if [[ -n "$RD_ID" ]]; then
+        info "RustDesk ID: $RD_ID"
+        _log "RustDesk ID: $RD_ID"
+    else
+        info "RustDesk ID not yet generated — open RustDesk on the device to create it."
+        _log "RustDesk ID: not yet generated (no display available)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Step 13: Done
 # ---------------------------------------------------------------------------
 
 _log "Jetson enrollment complete | hostname=$HOSTNAME_ID | tailscale_ip=$TS_IP"
@@ -394,6 +477,11 @@ printf "  Hostname      : %s\n" "$HOSTNAME_ID"
 printf "  Tailscale IP  : %s\n" "$TS_IP"
 printf "  SSH           : Key auth only, Tailscale interface only\n"
 printf "  Log uploads   : Every 6h via cron -> s3://%s\n" "$S3_BUCKET"
+if [[ -n "$RD_ID" ]]; then
+    printf "  RustDesk ID   : %s\n" "$RD_ID"
+else
+    printf "  RustDesk ID   : Open RustDesk app to view\n"
+fi
 printf "  Log file      : %s\n" "$LOG_FILE"
-printf "  Device is enrolled and ready for remote Ansible management.\n"
+printf "  Device is enrolled and ready for remote management.\n"
 printf "============================================================\n"

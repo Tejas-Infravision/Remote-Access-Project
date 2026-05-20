@@ -439,6 +439,105 @@ Set-FleetFirewallRule -Name "Fleet - WinRM (Tailscale)" -Port 5985 -RemoteAddres
 Write-Log "Firewall rules set: SSH (22) and WinRM (5985), source $tailscaleRange"
 
 # ---------------------------------------------------------------------------
+# Step 11: Install RustDesk for remote GUI access
+# ---------------------------------------------------------------------------
+
+Write-Step "Installing RustDesk for remote GUI access"
+
+$rustdeskKey     = $cfg["RUSTDESK_KEY"]
+$ec2TailscaleIp  = $cfg["EC2_TAILSCALE_IP"]
+$rustdeskVersion = "1.3.9"
+$rustdeskExe     = "C:\Program Files\RustDesk\rustdesk.exe"
+$rustdeskId      = $null
+
+if (-not $rustdeskKey -or $rustdeskKey -match "xxxxxx" -or $rustdeskKey -eq "") {
+    Write-Info "RUSTDESK_KEY not configured in config.env — skipping RustDesk install."
+    Write-Info "Set RUSTDESK_KEY to the hbbs public key and re-run to enable GUI access."
+    Write-Log "RustDesk skipped: RUSTDESK_KEY not configured."
+} else {
+    if (Test-Path $rustdeskExe) {
+        Write-Info "RustDesk already installed — skipping download."
+    } else {
+        Write-Info "Downloading RustDesk $rustdeskVersion ..."
+        $rdUrl  = "https://github.com/rustdesk/rustdesk/releases/download/$rustdeskVersion/rustdesk-$rustdeskVersion-x86_64.exe"
+        $rdPath = Join-Path $env:TEMP "rustdesk-setup.exe"
+        try {
+            Invoke-WebRequest -Uri $rdUrl -OutFile $rdPath -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Write-Fatal "Failed to download RustDesk: $_`nCheck internet access and try again."
+        }
+        Write-Info "Installing RustDesk silently ..."
+        try {
+            $proc = Start-Process -FilePath $rdPath -ArgumentList "--silent-install" -Wait -PassThru -ErrorAction Stop
+            # Exit code 1 is normal for NSIS silent install (means "already running, restarted")
+            if ($proc.ExitCode -notin @(0, 1)) {
+                Write-Fatal "RustDesk installer exited with code $($proc.ExitCode). Try installing manually."
+            }
+        } catch {
+            Write-Fatal "RustDesk installation failed: $_"
+        }
+        Write-Info "RustDesk installed."
+        Write-Log "RustDesk installed."
+    }
+
+    # Write server config to the LocalService profile where the RustDesk service reads it
+    $rdConfigDir = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config"
+    if (-not (Test-Path $rdConfigDir)) {
+        New-Item -ItemType Directory -Path $rdConfigDir -Force | Out-Null
+    }
+    $rdConfigContent = @"
+[options]
+custom-rendezvous-server = '$ec2TailscaleIp'
+key = '$rustdeskKey'
+relay-server = '$ec2TailscaleIp'
+api-server = 'http://$ec2TailscaleIp'
+"@
+    try {
+        $rdConfigContent | Out-File -FilePath "$rdConfigDir\RustDesk2.toml" -Encoding utf8 -Force
+        Write-Info "RustDesk server config written to LocalService profile."
+        Write-Log "RustDesk configured: server=$ec2TailscaleIp"
+    } catch {
+        Write-Info "Warning: Could not write RustDesk config: $_"
+    }
+
+    # Start (or restart) the RustDesk service
+    try {
+        $rdSvc = Get-Service -Name "RustDesk" -ErrorAction SilentlyContinue
+        if ($rdSvc) {
+            if ($rdSvc.Status -eq "Running") {
+                Restart-Service "RustDesk" -ErrorAction Stop
+                Write-Info "RustDesk service restarted to apply config."
+            } else {
+                Start-Service "RustDesk" -ErrorAction Stop
+                Write-Info "RustDesk service started."
+            }
+            Set-Service "RustDesk" -StartupType Automatic -ErrorAction Stop
+            Write-Info "RustDesk configured to start automatically on boot."
+        } else {
+            Write-Info "Warning: RustDesk service not found. Try restarting the laptop."
+        }
+        Write-Log "RustDesk service running and set to auto-start."
+    } catch {
+        Write-Info "Warning: Could not manage RustDesk service: $_"
+        Write-Info "Start it manually with: net start RustDesk"
+    }
+
+    # Retrieve the RustDesk ID so it can be recorded
+    Start-Sleep -Seconds 4
+    try {
+        $rdIdOutput = & "$rustdeskExe" --get-id 2>&1
+        $rustdeskId = ($rdIdOutput | Out-String).Trim()
+    } catch {}
+    if ($rustdeskId) {
+        Write-Info "RustDesk ID: $rustdeskId"
+        Write-Log "RustDesk ID: $rustdeskId"
+    } else {
+        Write-Info "RustDesk ID not yet available — open the RustDesk app to generate it."
+        Write-Log "RustDesk ID: not yet generated"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 
@@ -453,6 +552,11 @@ Write-Host "  Hostname      : $hostname"
 Write-Host "  Tailscale IP  : $tailscaleIp"
 Write-Host "  SSH (port 22) : Key auth only, Tailscale range only"
 Write-Host "  WinRM (5985)  : Tailscale range only"
+if ($rustdeskId) {
+    Write-Host "  RustDesk ID   : $rustdeskId"
+} else {
+    Write-Host "  RustDesk ID   : Open RustDesk app to view"
+}
 Write-Host "  Log           : $LogFile"
-Write-Host "  Device is enrolled and ready for remote Ansible management."
+Write-Host "  Device is enrolled and ready for remote management."
 Write-Host "============================================================" -ForegroundColor Green

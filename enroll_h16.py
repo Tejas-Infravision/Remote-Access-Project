@@ -27,8 +27,11 @@ ADB_PATH   = BUNDLE_DIR / "platform-tools-r33" / "adb.exe"  # bundled inside exe
 APK_PATH   = BUNDLE_DIR / "apks" / "tailscale-1.24.2.apk"   # bundled inside exe
 APK_REMOTE = "/sdcard/tailscale.apk"
 
-TAILSCALE_PKG = "com.tailscale.ipn.android"
-CHROME_PKG    = "com.android.chrome"
+TAILSCALE_PKG  = "com.tailscale.ipn.android"
+CHROME_PKG     = "com.android.chrome"
+RUSTDESK_PKG   = "com.carriez.flutter_hbb"
+RUSTDESK_APK   = BUNDLE_DIR / "apks" / "rustdesk.apk"
+RUSTDESK_REMOTE = "/sdcard/rustdesk.apk"
 
 # ADB target — mutated by set_adb_target()
 _adb_target: list[str] = []
@@ -452,7 +455,84 @@ def main() -> None:
         info(f"  Warning: Could not fully configure persistent ADB: {e}")
         info("  This can be configured manually on the device if needed.")
 
-    # 16. Try to read Tailscale IP from device
+    # 16. Install RustDesk for remote GUI / screen-share access
+    step("Installing RustDesk for remote GUI access")
+    rustdesk_key    = cfg.get("RUSTDESK_KEY", "")
+    ec2_tailscale_ip = cfg.get("EC2_TAILSCALE_IP", "")
+
+    if not RUSTDESK_APK.exists():
+        info("RustDesk APK not found in apks/ folder — skipping GUI access setup.")
+        info("Place rustdesk.apk in the apks/ folder and re-run to enable GUI access.")
+        _log("RustDesk skipped: APK not present in apks/")
+    elif is_package_installed(RUSTDESK_PKG):
+        info("RustDesk already installed on device.")
+        _log("RustDesk already present on device.")
+    else:
+        info("Pushing RustDesk APK to device...")
+        rd_pushed = False
+        for attempt in range(1, 4):
+            info(f"  Push attempt {attempt}/3...")
+            try:
+                adb_ok("push", str(RUSTDESK_APK), RUSTDESK_REMOTE, timeout=120)
+            except RuntimeError as e:
+                info(f"  Push error: {e}")
+                if attempt < 3:
+                    info("  Retrying in 3 seconds...")
+                    time.sleep(3)
+                    continue
+                else:
+                    break
+            rc2, out2, _ = adb_run("shell", "stat", "-c", "%s", RUSTDESK_REMOTE)
+            try:
+                sz = int(out2.strip())
+            except ValueError:
+                sz = 0
+            if sz > 0:
+                info(f"  RustDesk APK on device: {sz:,} bytes.")
+                _log(f"RustDesk APK pushed: {sz} bytes")
+                rd_pushed = True
+                break
+            if attempt < 3:
+                info("  APK arrived as 0 bytes — retrying in 3 seconds...")
+                time.sleep(3)
+
+        if rd_pushed:
+            rc3, _, err3 = adb_run(
+                "shell", "am", "start",
+                "-t", "application/vnd.android.package-archive",
+                "-d", f"file://{RUSTDESK_REMOTE}",
+                timeout=15,
+            )
+            if rc3 != 0:
+                info(f"  am start returned non-zero: {err3.strip()} — installer may still have opened.")
+
+            technician_prompt(
+                "The RustDesk installer should appear on the H16 screen.\n"
+                "    On the H16:\n"
+                "      1. If asked to choose an app, select 'Package Installer'\n"
+                "         (do NOT select xbrowser or any browser)\n"
+                "      2. Tap 'Install'\n"
+                "      3. Wait for 'App installed'"
+            )
+
+            # Attempt to auto-configure the server via RustDesk's deep link URI.
+            # This only works if the app registered itself as a URI handler during install.
+            if rustdesk_key and ec2_tailscale_ip and "xxxxxx" not in rustdesk_key:
+                info("Attempting to auto-configure RustDesk server via deep link...")
+                rd_uri = f"rustdesk://server?k={rustdesk_key}&r={ec2_tailscale_ip}"
+                adb_run("shell", "am", "start", "-a", "android.intent.action.VIEW",
+                        "-d", rd_uri, timeout=10)
+                info("Deep link sent. Verify on the H16 that RustDesk shows the correct server.")
+                info(f"  Server: {ec2_tailscale_ip}")
+            else:
+                info("RUSTDESK_KEY not configured — server must be set manually in the RustDesk app.")
+
+            _log("RustDesk APK installed on H16.")
+        else:
+            info("RustDesk APK push failed — skipping GUI access setup.")
+            _log("RustDesk APK push failed.")
+
+    # 17. Try to read Tailscale IP from device
     tailscale_ip: str | None = None
     try:
         rc, out, _ = adb_run("shell", "ip", "addr", "show", "tailscale0", timeout=10)
@@ -462,7 +542,7 @@ def main() -> None:
     except Exception:
         pass
 
-    # 17. Log and print result
+    # 18. Log and print result
     device_id = usb_serial or wifi_ip or "unknown"
     _log(
         f"H16 enrollment complete | device={device_id} | "
@@ -478,6 +558,7 @@ def main() -> None:
         print("  Tailscale IP  : Check https://login.tailscale.com/admin/machines")
     if wifi_ip:
         print(f"  WiFi ADB addr : {wifi_ip}:5555 (persistent)")
+    print("  RustDesk      : Open the RustDesk app on H16 to find its ID")
     print("  Device is enrolled and ready for remote management.")
     print("=" * 60)
 
