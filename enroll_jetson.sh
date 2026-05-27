@@ -118,11 +118,7 @@ if [[ "$ALREADY_ENROLLED" != "true" ]]; then
     step "Authenticating Tailscale and enabling Tailscale SSH"
     info "Running: tailscale up --authkey=<key> --ssh"
     if ! tailscale up --authkey="$TAILSCALE_AUTH_KEY" --ssh; then
-        fatal (
-            "tailscale up failed.\n" \
-            "Check that TAILSCALE_AUTH_KEY in config.env is valid and not expired.\n" \
-            "Generate a new key at: https://login.tailscale.com/admin/settings/keys"
-        )
+        fatal "tailscale up failed.\nCheck that TAILSCALE_AUTH_KEY in config.env is valid and not expired.\nGenerate a new key at: https://login.tailscale.com/admin/settings/keys"
     fi
     info "Tailscale authenticated."
     _log "Tailscale authenticated."

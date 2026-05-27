@@ -215,6 +215,11 @@ must be running the RustDesk relay components:
      the same directory. Copy the entire contents of that file and paste
      it as the RUSTDESK_KEY value in config.env before enrolling devices.
 
+     Also set RUSTDESK_PRESET_PASSWORD in config.env to a strong shared
+     password. This is the permanent password used for unattended access,
+     so the team can connect without anyone present at the device. If it is
+     left blank, devices fall back to a one-time password shown on screen.
+
   3. Ports required on the EC2 server (Tailscale mesh only):
        21115 TCP — hbbs (NAT test)
        21116 TCP/UDP — hbbs (peer ID registration)
@@ -234,9 +239,9 @@ CONNECTING TO A DEVICE
   3. Enter the device's RustDesk ID (printed at the end of enrollment
      or visible in the RustDesk app on the device) and click Connect.
 
-  4. When prompted for a password, use the one-time password shown in
-     the RustDesk app on the device, or configure a permanent password
-     in the RustDesk settings on the device.
+  4. When prompted for a password, use the permanent password that was set
+     as RUSTDESK_PRESET_PASSWORD during enrollment. (If that was left blank,
+     use the one-time password shown in the RustDesk app on the device.)
 
 H16 HAND CONTROLLER NOTES
   - After enrollment, open the RustDesk app on the H16 to see its ID.
@@ -244,6 +249,10 @@ H16 HAND CONTROLLER NOTES
     before running enroll_h16.py. Download rustdesk.apk from
     https://github.com/rustdesk/rustdesk/releases and rename it
     to rustdesk.apk in the apks/ folder.
+  - If RUSTDESK_PRESET_PASSWORD is set in config.env, the script pauses and
+    asks the technician to set that same password in the RustDesk app
+    (Settings > Security > permanent password). Android has no command-line
+    way to set it automatically, so this step is manual.
 
 JETSON NOTES
   - RustDesk on the Jetson requires an active display session to share

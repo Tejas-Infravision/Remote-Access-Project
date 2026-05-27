@@ -2,7 +2,13 @@
 """
 H16 Hand Controller Fleet Enrollment Script
 Run on a Windows technician laptop with the H16 plugged in via USB.
-Requires: frida Python package (pip install frida), frida-server-*-android-arm64 binary in script dir.
+
+Tailscale auth strategy:
+  1. Best-effort automated auth-key login via Frida injection. Requires the `frida`
+     Python package (pip install frida), a frida-server-*-android-arm64 binary in the
+     script dir, and a rooted H16. Tailscale must already be installed on the device.
+  2. If automation fails, falls back to guiding the technician through manual
+     Tailscale sign-in via Chrome (the only login path that works on v1.24.2 Android).
 """
 
 import os
@@ -27,8 +33,21 @@ BUNDLE_DIR = Path(sys._MEIPASS) if (_FROZEN and hasattr(sys, "_MEIPASS")) else P
 
 LOG_FILE   = SCRIPT_DIR / "enrollment_log.txt"
 
-# r33 ADB at the fixed path — must be 1.0.41; v37.x writes 0 bytes to H16 via USB push
-ADB_PATH   = Path(r"C:\platform-tools-old\adb.exe")
+# r33 ADB — must be 1.0.41; v37.x writes 0 bytes to H16 via USB push.
+# Resolve from the bundled location first (PyInstaller/script dir), then the fixed
+# install path, so the same exe works whether ADB is bundled or pre-installed.
+def _resolve_adb() -> Path:
+    candidates = [
+        BUNDLE_DIR / "platform-tools-r33" / "adb.exe",
+        SCRIPT_DIR / "platform-tools-r33" / "adb.exe",
+        Path(r"C:\platform-tools-old\adb.exe"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+ADB_PATH = _resolve_adb()
 
 TAILSCALE_PKG      = "com.tailscale.ipn"
 TAILSCALE_ACTIVITY = "com.tailscale.ipn/.IPNActivity"
@@ -466,6 +485,43 @@ def sharedprefs_fallback(auth_key: str) -> None:
     _log("SharedPreferences fallback: artefacts pulled for manual analysis.")
 
 # ---------------------------------------------------------------------------
+# Manual Chrome sign-in fallback
+# ---------------------------------------------------------------------------
+
+CHROME_PKG = "com.android.chrome"
+
+def manual_signin_fallback() -> None:
+    """
+    Fallback when automated (Frida) auth does not complete: guide the technician
+    through manual Tailscale sign-in via Chrome. This is the documented field path
+    (see README) and is the only login method that works on Tailscale v1.24.2 for
+    Android, where deep-link / CLI auth-key login is unsupported.
+    """
+    step("Falling back to manual Tailscale sign-in")
+    if not is_package_installed(CHROME_PKG):
+        info("  Chrome is NOT installed on the H16.")
+        technician_prompt(
+            "Install Google Chrome on the H16 first:\n"
+            "    1. Open the Play Store on the H16\n"
+            "    2. Search for 'Google Chrome' and install it\n"
+            "    3. Set Chrome as the default browser\n"
+            "    (Tailscale sign-in fails in xbrowser — Chrome is required.)"
+        )
+    else:
+        info("  Chrome is installed.")
+    # Bring the Tailscale app to the foreground for sign-in
+    adb_run("shell", "am", "start", "-n", TAILSCALE_ACTIVITY)
+    technician_prompt(
+        "On the H16, sign into Tailscale manually:\n"
+        "    1. Open the Tailscale app\n"
+        "    2. Tap 'Sign In'\n"
+        "    3. If asked which browser to use, choose Chrome (NOT xbrowser)\n"
+        "    4. Sign in with your work account and approve the VPN request\n"
+        "    5. Wait until Tailscale shows 'Connected'"
+    )
+    _log("Manual sign-in fallback prompted.")
+
+# ---------------------------------------------------------------------------
 # Wait for logcat auth confirmation
 # ---------------------------------------------------------------------------
 
@@ -523,8 +579,9 @@ def main() -> None:
     step(f"Verifying ADB: {ADB_PATH}")
     if not ADB_PATH.exists():
         fatal(
-            f"ADB not found at {ADB_PATH}\n"
-            "Ensure C:\\platform-tools-old\\ contains r33 platform tools (ADB 1.0.41).\n"
+            f"ADB not found. Looked for adb.exe at:\n  {ADB_PATH}\n"
+            "Provide r33 platform tools (ADB 1.0.41) either bundled in 'platform-tools-r33\\'\n"
+            "next to this script, or installed at C:\\platform-tools-old\\.\n"
             "Do NOT use ADB v37.x — it writes 0 bytes to the H16 via USB push."
         )
     rc, out, err = adb_run("version")
@@ -633,11 +690,18 @@ def main() -> None:
         info("  Login method called — waiting for IPN state change...")
     else:
         info("  Frida did not call a Java auth method.")
-        info("  Attempting SharedPreferences fallback...")
+        info("  Attempting SharedPreferences fallback (artefact capture only)...")
         sharedprefs_fallback(auth_key)
 
     # 9. Wait for logcat to confirm NeedsLogin -> Running
     auth_ok = wait_for_auth(logcat_event, timeout_sec=120)
+
+    # 9b. If automated auth did not land, fall back to manual Chrome sign-in.
+    #     The logcat monitor thread is still watching, so reuse its event.
+    if not auth_ok and read_tailscale_ip() is None:
+        info("  Automated auth did not complete — switching to manual sign-in.")
+        manual_signin_fallback()
+        auth_ok = wait_for_auth(logcat_event, timeout_sec=180)
 
     if not auth_ok:
         # Check interface directly as a secondary confirmation
@@ -648,11 +712,11 @@ def main() -> None:
             auth_ok = True
         else:
             fatal(
-                "Tailscale did not authenticate within 2 minutes.\n"
+                "Tailscale did not authenticate (automated and manual sign-in both failed).\n"
                 "Possible causes:\n"
                 "  - Auth key is expired or already consumed; generate a new ephemeral key\n"
-                "  - Frida could not find the login method in this build of Tailscale v1.24.2\n"
-                "  - frida-server version does not match the frida Python module version\n"
+                "  - Manual sign-in was not completed in the Tailscale app via Chrome\n"
+                "  - Tailscale is not installed on the H16 (this script does not install it)\n"
                 "  - com.tailscale.ipn process was not running when Frida attached\n"
                 "Manual check: adb shell logcat | grep -i 'ipn state'"
             )
@@ -695,8 +759,9 @@ def main() -> None:
 
     # 12. Install RustDesk
     step("Installing RustDesk for remote GUI access")
-    rustdesk_key     = cfg.get("RUSTDESK_KEY", "")
-    ec2_tailscale_ip = cfg.get("EC2_TAILSCALE_IP", "")
+    rustdesk_key      = cfg.get("RUSTDESK_KEY", "")
+    ec2_tailscale_ip  = cfg.get("EC2_TAILSCALE_IP", "")
+    rustdesk_password = cfg.get("RUSTDESK_PRESET_PASSWORD", "")
 
     if not RUSTDESK_APK.exists():
         info("RustDesk APK not found in apks/ — skipping GUI access setup.")
@@ -742,16 +807,38 @@ def main() -> None:
                 "The RustDesk installer should appear on the H16 screen.\n"
                 "    Select 'Package Installer', tap 'Install', wait for 'App installed'."
             )
-            if rustdesk_key and ec2_tailscale_ip and "xxxxxx" not in rustdesk_key:
-                rd_uri = f"rustdesk://server?k={rustdesk_key}&r={ec2_tailscale_ip}"
-                adb_run(
-                    "shell", "am", "start", "-a", "android.intent.action.VIEW",
-                    "-d", rd_uri, timeout=10,
-                )
-                info(f"  RustDesk server configured: {ec2_tailscale_ip}")
+            # Verify the package is actually present before trying to configure it
+            time.sleep(2)
+            if not is_package_installed(RUSTDESK_PKG):
+                info("  RustDesk does not appear to be installed yet.")
+                info("  Finish the install on the H16 screen, then open RustDesk and")
+                info("  configure the server manually (see README) if it is not set.")
+                _log("RustDesk install could not be verified on H16.")
             else:
-                info("  RUSTDESK_KEY not set — configure server manually in the RustDesk app.")
-            _log("RustDesk installed on H16.")
+                info("  RustDesk install verified.")
+                if rustdesk_key and ec2_tailscale_ip and "xxxxxx" not in rustdesk_key:
+                    rd_uri = f"rustdesk://server?k={rustdesk_key}&r={ec2_tailscale_ip}"
+                    adb_run(
+                        "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                        "-d", rd_uri, timeout=10,
+                    )
+                    info(f"  RustDesk server configured: {ec2_tailscale_ip}")
+                else:
+                    info("  RUSTDESK_KEY not set — configure server manually in the RustDesk app.")
+                # Permanent password for unattended access — Android RustDesk has no
+                # CLI for this, so the technician must set it in the app.
+                if rustdesk_password and "xxxxxx" not in rustdesk_password:
+                    technician_prompt(
+                        "Set the RustDesk permanent password for unattended access:\n"
+                        "    1. Open the RustDesk app on the H16\n"
+                        "    2. Go to Settings > Security > 'Set permanent password'\n"
+                        f"    3. Enter this exact password: {rustdesk_password}\n"
+                        "    (Lets engineering connect with nobody at the device.)"
+                    )
+                    _log("RustDesk permanent password: technician prompted to set.")
+                else:
+                    info("  RUSTDESK_PRESET_PASSWORD not set — RustDesk will use a one-time password.")
+                _log("RustDesk installed on H16.")
         else:
             info("RustDesk APK push failed — skipping.")
             _log("RustDesk APK push failed.")

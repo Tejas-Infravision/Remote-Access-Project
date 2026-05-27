@@ -444,8 +444,9 @@ Write-Log "Firewall rules set: SSH (22) and WinRM (5985), source $tailscaleRange
 
 Write-Step "Installing RustDesk for remote GUI access"
 
-$rustdeskKey     = $cfg["RUSTDESK_KEY"]
-$ec2TailscaleIp  = $cfg["EC2_TAILSCALE_IP"]
+$rustdeskKey      = $cfg["RUSTDESK_KEY"]
+$ec2TailscaleIp   = $cfg["EC2_TAILSCALE_IP"]
+$rustdeskPassword = $cfg["RUSTDESK_PRESET_PASSWORD"]
 $rustdeskVersion = "1.3.9"
 $rustdeskExe     = "C:\Program Files\RustDesk\rustdesk.exe"
 $rustdeskId      = $null
@@ -522,8 +523,27 @@ api-server = 'http://$ec2TailscaleIp'
         Write-Info "Start it manually with: net start RustDesk"
     }
 
-    # Retrieve the RustDesk ID so it can be recorded
+    # Give the service a moment to come up before talking to it over IPC
     Start-Sleep -Seconds 4
+
+    # Set a permanent (unattended) password so engineers can connect with nobody
+    # present. 'rustdesk --password' reaches the running service over IPC and
+    # stores it in the service config.
+    if ($rustdeskPassword -and $rustdeskPassword -notmatch "xxxxxx") {
+        try {
+            & "$rustdeskExe" --password "$rustdeskPassword" 2>&1 | Out-Null
+            Write-Info "RustDesk permanent password set for unattended access."
+            Write-Log "RustDesk permanent password configured."
+        } catch {
+            Write-Info "Warning: Could not set RustDesk permanent password: $_"
+            Write-Info "Set it manually: RustDesk > Settings > Security > Permanent password."
+        }
+    } else {
+        Write-Info "RUSTDESK_PRESET_PASSWORD not set - connections will need the on-screen one-time password."
+        Write-Log "RustDesk permanent password not configured."
+    }
+
+    # Retrieve the RustDesk ID so it can be recorded
     try {
         $rdIdOutput = & "$rustdeskExe" --get-id 2>&1
         $rustdeskId = ($rdIdOutput | Out-String).Trim()
